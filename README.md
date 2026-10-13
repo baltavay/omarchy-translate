@@ -92,18 +92,29 @@ echo "привет" | ~/.config/omarchy/plugins/io.github.baltavay.translate/bin
 
 ## Install
 
+From the marketplace listing, or straight from git:
+
+```bash
+omarchy plugin add https://github.com/baltavay/omarchy-translate.git --enable
+```
+
+That clones the repo into `~/.config/omarchy/plugins/io.github.baltavay.translate/`,
+validates the manifest, and enables the overlay. Installing by hand instead:
+check the folder, then add the id to `plugins[]` in `~/.config/omarchy/shell.json`
+(the shell hot-reloads it) and add the keybinding to `~/.config/hypr/bindings.lua`:
+
 ```bash
 omarchy plugin validate ~/.config/omarchy/plugins/io.github.baltavay.translate
 ```
-
-Then add the id to `plugins[]` in `~/.config/omarchy/shell.json` (the shell
-hot-reloads it) and add the keybinding to `~/.config/hypr/bindings.lua`:
 
 ```lua
 o.bind("SUPER + SHIFT + K", "Translate", "omarchy-shell shell toggle io.github.baltavay.translate")
 hl.layer_rule({ match = { namespace = "^omarchy-translate$" }, no_anim = true, animation = "none" })
 ```
 
+The plugin ships no keybinding and no menu row of its own — it never edits your
+config. Add the lines above (plus the `trigger.translate` row from
+`omarchy-menu.jsonc` if you want it in the Omarchy menu) to make it yours.
 `Super+Shift+K` is free on stock Omarchy (`Super+K` is keybindings, `Super+Alt+K`
 tmux, `Super+Ctrl+K` herdr). `omarchy-shell shell toggle io.github.baltavay.translate` is
 the same thing from a terminal.
