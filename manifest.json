@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.baltavay.translate",
+  "name": "Translate",
+  "version": "1.0.0",
+  "author": "Maksat Mansurov",
+  "license": "MIT",
+  "description": "Keyboard-first translation overlay with two panes, language pickers, and a keyless free backend (Google dictionary endpoint, MyMemory fallback). Remembers the last language pair.",
+  "kinds": [
+    "overlay"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "overlay": "Translate.qml"
+  }
+}

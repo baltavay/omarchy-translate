@@ -1,0 +1,9 @@
+{
+  // Merge into ~/.config/omarchy/extensions/omarchy-menu.jsonc
+  "trigger.translate": {
+    "icon": "󰗊",
+    "label": "Translate",
+    "aliases": ["translate", "перевод"],
+    "action": "omarchy-shell shell toggle io.github.baltavay.translate"
+  }
+}
