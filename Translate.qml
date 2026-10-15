@@ -5,6 +5,7 @@ import Quickshell.Wayland
 import qs.Commons
 import qs.Ui as Ui
 import "Languages.js" as Languages
+import "Engines.js" as Engines
 
 // Keyboard-first translation overlay for omarchy-shell.
 //
@@ -17,9 +18,10 @@ import "Languages.js" as Languages
 //
 // The overlay lives inside the long-lived omarchy-shell process and keeps its
 // panes, chosen languages, and in-flight request across summons (manifest
-// keepLoaded). All network work lives in bin/translate-fetch: the QML hands
-// the script the text as argv and reads one JSON object back, so the view
-// never speaks HTTP and a hung request can be killed without touching the UI.
+// keepLoaded). Engines.js does the talking with XMLHttpRequest inside that same
+// process: no helper is spawned, so neither the text being translated nor the
+// translation ever lands on a command line, where /proc/<pid>/cmdline would
+// hand it to every local user. A hung request is aborted from here.
 Item {
   id: root
 
@@ -29,10 +31,12 @@ Item {
   property var manifest: null
 
   readonly property string pluginId: (manifest && manifest.id) || "io.github.baltavay.translate"
-  readonly property string pluginDir: String(Qt.resolvedUrl(".")).replace(/^file:\/\//, "")
-  readonly property string fetchScript: pluginDir + "bin/translate-fetch"
   readonly property string stateDir: (Quickshell.env("XDG_STATE_HOME") || (Quickshell.env("HOME") + "/.local/state")) + "/omarchy"
   readonly property string statePath: stateDir + "/translate.json"
+
+  // Which engine goes first, and the MyMemory address that lifts its quota.
+  readonly property string enginePreference: Quickshell.env("OMARCHY_TRANSLATE_ENGINE") || ""
+  readonly property string contactEmail: Quickshell.env("OMARCHY_TRANSLATE_EMAIL") || ""
 
   // ---------------------------------------------------------------- state
 
@@ -60,9 +64,9 @@ Item {
   property int requestSeq: 0
   property int pendingSeq: -1
   property bool queuedTranslate: false
-  property bool outputHandled: false
+  property var activeRequest: null
+  property var timedOutRequest: null
   property real startedAt: 0
-  property string stderrText: ""
   property string translatedSource: ""
   property bool syncingText: false
 
@@ -277,9 +281,20 @@ Item {
       root.status = "nothing to copy"
       return
     }
-    Quickshell.execDetached(["wl-copy", "--type", "text/plain", text])
+    root.writeClipboard(text)
     root.copied = true
     copyFlash.restart()
+  }
+
+  // wl-copy reads the text from stdin. Handing it over as an argument would
+  // put it in the child's argv, readable by every local user while the process
+  // lives; the pipe is private to the shell and wl-copy. A copy pressed while
+  // one is still running is written by the process that starts when it exits,
+  // because running stays true in between.
+  function writeClipboard(text) {
+    copyProc.payload = text
+    copyProc.stdinEnabled = true
+    copyProc.running = true
   }
 
   function pasteSource() {
@@ -312,56 +327,100 @@ Item {
     root.startFetch(text)
   }
 
+  // The transport Engines issues requests through: an XHR capped by the
+  // fetchTimeout Timer. Only one request is in flight at a time (chunks go out
+  // one by one), so a single Timer and a single slot for the request to abort
+  // are enough.
+  function timedRequest(url, timeoutMs, onReply) {
+    var xhr = new XMLHttpRequest()
+    var settled = false
+    var stopped = false
+    var timedOut = false
+
+    function settle(reply) {
+      if (settled) return
+      settled = true
+      root.timedOutRequest = null
+      fetchTimeout.stop()
+      onReply(reply)
+    }
+
+    xhr.open("GET", url)
+    xhr.timeout = timeoutMs // honored where the engine supports it
+    xhr.onreadystatechange = function() {
+      if (xhr.readyState !== XMLHttpRequest.DONE) return
+      if (xhr.status === 0) {
+        // A dropped request reports status 0: say why it was dropped, when we know.
+        settle({ error: timedOut ? "timeout" : stopped ? "cancelled" : "unreachable" })
+      } else settle({ status: xhr.status, body: xhr.responseText })
+    }
+    xhr.onerror = function() { settle({ error: "unreachable" }) }
+    xhr.onabort = function() { settle({ error: timedOut ? "timeout" : stopped ? "cancelled" : "unreachable" }) }
+    xhr.send()
+
+    var handle = {
+      abort: function() { stopped = true; xhr.abort() },
+      timeOut: function() { timedOut = true; xhr.abort() }
+    }
+    root.timedOutRequest = handle
+    fetchTimeout.interval = Math.max(1, timeoutMs)
+    fetchTimeout.restart()
+    return handle
+  }
+
   function startFetch(text) {
     root.requestSeq += 1
-    root.pendingSeq = root.requestSeq
-    root.outputHandled = false
-    root.stderrText = ""
+    var seq = root.requestSeq
+    root.pendingSeq = seq
     root.startedAt = Date.now()
     root.busy = true
     root.status = "translating…"
     root.errorText = ""
-    fetchProc.command = [root.fetchScript, root.sourceLang, root.targetLang, text]
-    fetchProc.running = true
+    root.activeRequest = Engines.translate({
+      text: text,
+      from: root.sourceLang,
+      to: root.targetLang,
+      engine: root.enginePreference,
+      email: root.contactEmail,
+      request: root.timedRequest
+    }, function(reply) {
+      if (seq !== root.pendingSeq) return
+      root.pendingSeq = -1
+      root.activeRequest = null
+      root.busy = false
+
+      if (reply.ok !== true) {
+        root.fail(String(reply.error || "translation failed"))
+        return
+      }
+
+      root.translatedSource = root.sourceText
+      root.setResultText(String(reply.text || ""))
+      root.engine = String(reply.engine || "")
+      if (reply.detected) root.detectedLang = String(reply.detected)
+      root.errorText = ""
+      var parts = []
+      if (root.engine && root.engine !== "none") parts.push(root.engine)
+      parts.push((Date.now() - root.startedAt) + " ms")
+      parts.push(root.sourceText.length + " chars")
+      if (root.sourceLang === "auto" && root.detectedLang)
+        parts.push("detected " + root.detectedLang)
+      root.status = parts.join(" · ")
+    })
   }
 
   function cancelFetch() {
-    if (!fetchProc.running) return
-    root.pendingSeq = -1
-    fetchProc.running = false
-  }
-
-  function handleFetchOutput(raw) {
-    if (root.outputHandled) return
-    if (root.pendingSeq === -1) return
-    root.outputHandled = true
+    if (!root.busy) return
     root.pendingSeq = -1
     root.busy = false
-
-    var reply = null
-    try { reply = JSON.parse(String(raw || "")) } catch (e) { reply = null }
-    if (!reply || typeof reply !== "object") {
-      var detail = String(root.stderrText || "").trim()
-      root.fail(detail !== "" ? detail : "translate-fetch returned nothing usable")
-      return
+    if (root.activeRequest) {
+      root.activeRequest.cancel()
+      root.activeRequest = null
     }
-    if (reply.ok !== true) {
-      root.fail(String(reply.error || "translation failed"))
-      return
+    if (root.queuedTranslate) {
+      root.queuedTranslate = false
+      root.translateNow(true)
     }
-
-    root.translatedSource = root.sourceText
-    root.setResultText(String(reply.text || ""))
-    root.engine = String(reply.engine || "")
-    if (reply.detected) root.detectedLang = String(reply.detected)
-    root.errorText = ""
-    var parts = []
-    if (root.engine && root.engine !== "none") parts.push(root.engine)
-    parts.push((Date.now() - root.startedAt) + " ms")
-    parts.push(root.sourceText.length + " chars")
-    if (root.sourceLang === "auto" && root.detectedLang)
-      parts.push("detected " + root.detectedLang)
-    root.status = parts.join(" · ")
   }
 
   function fail(message) {
@@ -514,6 +573,21 @@ Item {
     onTriggered: root.writeState()
   }
 
+  // The wall clock for a request in flight. Quickshell's XMLHttpRequest
+  // accepts xhr.timeout but never enforces it — a socket that accepts the
+  // connection and goes silent hangs the request forever — so the transport
+  // below arms this Timer and aborts when it fires, the way `curl --max-time`
+  // used to.
+  Timer {
+    id: fetchTimeout
+    repeat: false
+    onTriggered: {
+      var request = root.timedOutRequest
+      root.timedOutRequest = null
+      if (request) request.timeOut()
+    }
+  }
+
   Timer {
     id: copyFlash
     interval: 1400
@@ -529,28 +603,19 @@ Item {
     onLoaded: root.loadState(text())
   }
 
+  // The translation itself needs no process at all (see Engines.js); this is
+  // only the clipboard writer, and it takes the text on stdin.
   Process {
-    id: fetchProc
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: root.handleFetchOutput(text)
-    }
-    stderr: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: root.stderrText = text
-    }
-    onExited: function(exitCode, exitStatus) {
-      root.busy = false
-      if (root.pendingSeq !== -1 && !root.outputHandled) {
-        var detail = String(root.stderrText || "").replace(/\s+$/, "")
-        root.pendingSeq = -1
-        root.fail("translate-fetch exited with code " + exitCode + (detail ? ": " + detail : ""))
-      }
-      root.outputHandled = false
-      if (root.queuedTranslate) {
-        root.queuedTranslate = false
-        root.translateNow(true)
-      }
+    id: copyProc
+    property string payload: ""
+    command: ["wl-copy", "--type", "text/plain"]
+    stdinEnabled: false
+    onStarted: {
+      write(payload)
+      payload = ""
+      // Closes stdin — after the queued bytes have gone out — so wl-copy sees
+      // the end of its input and takes over the clipboard.
+      stdinEnabled = false
     }
   }
 

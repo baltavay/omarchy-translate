@@ -35,15 +35,19 @@ In the language picker: type to filter (code, English name or native name),
 - With auto-translate on (the default), typing translates after 600 ms of
   quiet; `Ctrl+Enter` translates immediately, request per pause.
 - Source `Auto` detects the input language and shows what it detected.
-- `Esc` during a request kills the `curl` instead of waiting for it.
+- `Esc` during a request aborts it instead of waiting for the endpoint.
 
 ## Backend
 
-`bin/translate-fetch <from> <to> <text|->` prints one JSON object:
+`Engines.js` translates from inside the shell process, over HTTPS, with
+`XMLHttpRequest` — no helper program, no `curl`, no `jq`:
 
-```json
-{"ok":true,"text":"привет","engine":"google","detected":"en"}
-```
+- the text never reaches a command line, so no other local user can read it out
+  of `/proc/<pid>/cmdline`;
+- it never touches the disk either, not even briefly in a temp file;
+- the only way it leaves the machine is the HTTPS request to the engine that
+  answers — everything else, like the copy shortcut putting the result on the
+  clipboard, happens because you asked for it.
 
 Engines, tried in order:
 
@@ -62,12 +66,8 @@ Knobs (environment):
 | `OMARCHY_TRANSLATE_ENGINE` | `google` (default) or `mymemory` — which engine is tried first |
 | `OMARCHY_TRANSLATE_EMAIL` | any address; raises MyMemory's anonymous daily quota |
 
-The file is also usable from a terminal:
-
-```bash
-~/.config/omarchy/plugins/io.github.baltavay.translate/bin/translate-fetch en ru "hello"
-echo "привет" | ~/.config/omarchy/plugins/io.github.baltavay.translate/bin/translate-fetch ru en -
-```
+Both come from the shell process's own environment, so export them before the
+shell starts — or restart the shell after changing them.
 
 ## Layout
 
@@ -76,7 +76,7 @@ echo "привет" | ~/.config/omarchy/plugins/io.github.baltavay.translate/bin
   manifest.json          plugin manifest (kind: overlay, keepLoaded)
   Translate.qml          overlay: panes, picker, shortcuts, persistence
   Languages.js           language table (code, English name, native name)
-  bin/translate-fetch    engine chain + chunking, one JSON object on stdout
+  Engines.js             engine chain, chunking, request/response handling
   omarchy-menu.jsonc     menu row to merge into ~/.config/omarchy/extensions/
   preview.png
 ```
@@ -84,8 +84,6 @@ echo "привет" | ~/.config/omarchy/plugins/io.github.baltavay.translate/bin
 ## Requirements
 
 - Omarchy Quattro (`omarchy-shell` / Quickshell `PanelWindow` overlay).
-- `curl` and `jq` — present on a stock Omarchy install; they do the talking in
-  `bin/translate-fetch`.
 - `wl-clipboard` (`wl-copy`, `wl-paste`) for the copy and paste shortcuts.
 - Network access to `clients5.google.com` and/or `api.mymemory.translated.net`.
   No API keys, no accounts, nothing to configure.

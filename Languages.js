@@ -1,7 +1,7 @@
 // Language table for the translate overlay.
 //
-// Codes are the ones Google's endpoints speak ("auto", "zh-CN", "pt"); the
-// fetch script normalizes the few legacy aliases (iw, nb, bare zh) itself.
+// Codes are the ones Google's endpoints speak ("auto", "zh-CN", "pt"); the few
+// legacy aliases (iw, nb, bare zh) are normalized in Engines.js.
 // English name first for searching, native name so the picker stays usable
 // when the reader can't read English.
 .pragma library
