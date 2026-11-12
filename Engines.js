@@ -27,6 +27,9 @@
 //   options.to       target language code, never "auto"
 //   options.engine   the engine to try first: "google" (default), "deepl" or
 //                    "mymemory"
+//   options.retarget language for text that turns out to be in the target one
+//                    already ("auto" source only), e.g. alternateLanguage(to);
+//                    "" to leave such text as it is
 //   options.email    MyMemory contact address; "" to leave it out
 //   options.deeplKey DeepL API key; without one DeepL is skipped
 //   options.locale   POSIX locale ("en_GB.UTF-8"), to pick DeepL's English and
@@ -39,7 +42,7 @@
 //                    overlay passes a Timer-backed one; tests pass a stub).
 //
 //   onDone(reply)    called at most once, with
-//                      {ok: true,  text, engine, detected, skipped} or
+//                      {ok: true,  text, engine, detected, skipped[, retargeted]} or
 //                      {ok: false, error, engine: "none", skipped}
 //                    skipped lists the engines that were tried first and did
 //                    not answer, as {engine, reason}, so a fallback is never
@@ -341,9 +344,81 @@ function parseChunk(engine, reply) {
   return engine === "mymemory" ? parseMyMemory(reply) : parseGoogle(reply)
 }
 
+// --------------------------------------------------------------- retarget
+
+// Where text already in the target language goes instead: English, or Russian
+// when the target is English itself — the pair swap() falls back to as well.
+function alternateLanguage(code) {
+  return normalizeLanguage(code) === "en" ? "ru" : "en"
+}
+
+// Whether two codes name one language: "uk" and "uk-UA" do (MyMemory answers
+// with a region), "zh-CN" and "zh-TW" do not.
+function sameLanguage(a, b) {
+  var x = normalizeLanguage(a)
+  var y = normalizeLanguage(b)
+  if (x === "" || y === "" || x === "auto" || y === "auto") return false
+  if (x === y) return true
+  if (x.indexOf("zh") === 0 || y.indexOf("zh") === 0) return false
+  return x.split("-")[0].toLowerCase() === y.split("-")[0].toLowerCase()
+}
+
+// One translation, plus a second pass when the source is "auto", a retarget
+// language is given, and the text turns out to be in the target language
+// already: that pass translates it into options.retarget instead, and its
+// reply says so with retargeted: <code>. An answer identical to the input
+// with no detected language counts as "already there" too, since Google's
+// dictionary endpoint answers short input without naming the language. If
+// the second pass fails, the first answer stands.
+function translate(options, onDone) {
+  var opts = options || {}
+  var state = { cancelled: false, handle: null }
+  var to = normalizeLanguage(opts.to)
+  var retarget = normalizeLanguage(opts.retarget)
+  var wanted = normalizeLanguage(opts.from) === "auto" && to !== "" && to !== "auto"
+    && retarget !== "" && retarget !== "auto" && retarget !== to
+
+  function alreadyThere(reply) {
+    if (sameLanguage(reply.detected, to)) return true
+    var known = normalizeLanguage(reply.detected)
+    return (known === "" || known === "auto")
+      && String(reply.text).trim() === String(opts.text === undefined || opts.text === null ? "" : opts.text).trim()
+  }
+
+  var firstHandle = translatePass(opts, function(first) {
+    if (state.cancelled) return
+    if (!wanted || first.ok !== true || first.engine === "none" || !alreadyThere(first)) {
+      onDone(first)
+      return
+    }
+    var again = {}
+    for (var key in opts) again[key] = opts[key]
+    again.from = to
+    again.to = retarget
+    state.handle = translatePass(again, function(second) {
+      if (state.cancelled) return
+      if (second.ok !== true) { onDone(first); return }
+      second.detected = to
+      second.retargeted = retarget
+      onDone(second)
+    })
+  })
+  // A transport may answer synchronously, in which case the second pass has
+  // already taken the slot; the finished first pass must not reclaim it.
+  if (state.handle === null) state.handle = firstHandle
+
+  return {
+    cancel: function() {
+      if (state.cancelled) return
+      state.cancelled = true
+      if (state.handle) state.handle.cancel()
+    }
+  }
+}
+
 // ----------------------------------------------------------------- driver
 
-function translate(options, onDone) {
+function translatePass(options, onDone) {
   var opts = options || {}
   var state = { cancelled: false, done: false, current: null }
   var engines = engineOrder(opts.engine, String(opts.deeplKey || "") !== "")

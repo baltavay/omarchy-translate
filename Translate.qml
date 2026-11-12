@@ -56,6 +56,9 @@ Item {
 
   property string engine: ""
   property string detectedLang: ""
+  // Set when Auto found the text already in the target language and the
+  // translation went to Engines.alternateLanguage(target) instead.
+  property string retargetLang: ""
   property string status: ""
   property string errorText: ""
   property bool busy: false
@@ -254,6 +257,7 @@ Item {
   function clearAll() {
     debounce.stop()
     root.translatedSource = ""
+    root.retargetLang = ""
     root.setSourceText("")
     root.setResultText("")
     root.status = ""
@@ -263,14 +267,17 @@ Item {
 
   function swap() {
     var from = root.sourceLang
-    var to = root.targetLang
+    // The language the result pane really holds: after a retarget that is
+    // not the target, and swapping must trade the real pair.
+    var to = root.retargetLang !== "" ? root.retargetLang : root.targetLang
+    root.retargetLang = ""
 
     if (from === "auto") {
       // Nothing concrete to translate from: pin the detected language instead,
       // and let the old target take over as the source.
       var detected = Languages.exists(root.detectedLang) ? root.detectedLang : "en"
       root.sourceLang = to
-      root.targetLang = detected === to ? (to === "en" ? "ru" : "en") : detected
+      root.targetLang = detected === to ? Engines.alternateLanguage(to) : detected
     } else {
       root.sourceLang = to
       root.targetLang = from === to ? "en" : from
@@ -446,6 +453,7 @@ Item {
       email: root.contactEmail,
       deeplKey: root.deeplKey,
       locale: root.localeName,
+      retarget: root.sourceLang === "auto" ? Engines.alternateLanguage(root.targetLang) : "",
       request: root.timedRequest
     }, function(reply) {
       if (seq !== root.pendingSeq) return
@@ -464,9 +472,12 @@ Item {
       root.setResultText(String(reply.text || ""))
       root.engine = String(reply.engine || "")
       if (reply.detected) root.detectedLang = String(reply.detected)
-      // DeepL bills the source characters; keep the chip's count close until
-      // the next open reads the real figure.
-      if (root.engine === "deepl" && root.deeplUsed >= 0) root.deeplUsed += text.length
+      root.retargetLang = reply.retargeted ? String(reply.retargeted) : ""
+      // DeepL bills the source characters (twice when the text had to be
+      // retargeted); keep the chip's count close until the next open reads
+      // the real figure.
+      if (root.engine === "deepl" && root.deeplUsed >= 0)
+        root.deeplUsed += text.length * (root.retargetLang !== "" ? 2 : 1)
       root.errorText = ""
       var parts = []
       if (root.engine && root.engine !== "none") parts.push(root.engine)
@@ -474,6 +485,8 @@ Item {
       parts.push(root.sourceText.length + " chars")
       if (root.sourceLang === "auto" && root.detectedLang)
         parts.push("detected " + root.detectedLang)
+      if (root.retargetLang !== "")
+        parts.push("already " + root.targetChip + " → " + Languages.chip(root.retargetLang))
       for (var i = 0; i < fallbacks.length; i++) parts.push(fallbacks[i])
       root.status = parts.join(" · ")
     })
@@ -687,6 +700,7 @@ Item {
       root.sourceLang = code
     }
     root.detectedLang = ""
+    root.retargetLang = ""
   }
 
   // ------------------------------------------------------------ shortcuts
@@ -1152,8 +1166,13 @@ Item {
                     spacing: Style.spacing.controlGap
 
                     Ui.Button {
-                      text: root.targetChip + " ▾"
-                      tooltipText: root.targetLanguage ? root.targetLanguage.name : root.targetChip
+                      text: root.retargetLang !== ""
+                        ? root.targetChip + " → " + Languages.chip(root.retargetLang) + " ▾"
+                        : root.targetChip + " ▾"
+                      tooltipText: root.retargetLang !== ""
+                        ? "Already in " + (root.targetLanguage ? root.targetLanguage.name : root.targetChip)
+                          + ", so translated into " + (Languages.byCode(root.retargetLang) ? Languages.byCode(root.retargetLang).name : root.retargetLang)
+                        : (root.targetLanguage ? root.targetLanguage.name : root.targetChip)
                       bordered: true
                       fontSize: Style.font.bodySmall
                       fontFamily: root.chromeFont

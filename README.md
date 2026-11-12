@@ -36,7 +36,11 @@ In the language picker: type to filter (code, English name or native name),
   overlay comes back the way you left it after a shell restart.
 - With auto-translate on (the default), typing translates after 600 ms of
   quiet; `Ctrl+Enter` translates immediately, request per pause.
-- Source `Auto` detects the input language and shows what it detected.
+- Source `Auto` detects the input language and shows what it detected. Text
+  that turns out to be in the target language already is translated into
+  English instead (Russian when the target is English): the target chip reads
+  `UK → EN`, the status says `already UK → EN`, and `Ctrl+S` swaps that real
+  pair. Finding out takes one request, so such text costs two.
 - `Esc` during a request aborts it instead of waiting for the endpoint.
 
 ## Backend
