@@ -534,7 +534,9 @@ Item {
     var state = null
     try { state = JSON.parse(String(raw || "")) } catch (e) { state = null }
     if (!state || typeof state !== "object") return
-    if (typeof state.source === "string" && Languages.exists(state.source) && state.source !== "auto")
+    // Auto is a real source choice (swap() pins the detected language), so it
+    // comes back like any other; only the target can never be auto.
+    if (typeof state.source === "string" && Languages.exists(state.source))
       root.sourceLang = state.source
     if (typeof state.target === "string" && Languages.exists(state.target) && state.target !== "auto")
       root.targetLang = state.target
