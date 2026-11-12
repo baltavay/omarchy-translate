@@ -41,8 +41,12 @@ Item {
   // ---------------------------------------------------------------- state
 
   property bool opened: false
-  property string sourceLang: "en"
-  property string targetLang: "ru"
+  // Until a pair is saved: detect the source, translate into the user's own
+  // language as the locale names it (English when it is not in the table).
+  property string sourceLang: "auto"
+  property string targetLang: Languages.fromLocale(
+    Quickshell.env("LANGUAGE"), Quickshell.env("LC_ALL"),
+    Quickshell.env("LC_MESSAGES"), Quickshell.env("LANG"))
   property string sourceText: ""
   property string resultText: ""
   property bool autoTranslate: true
