@@ -9,7 +9,8 @@ import "Engines.js" as Engines
 
 // Keyboard-first translation overlay for omarchy-shell.
 //
-// SUPER + SHIFT + K summons it. Two panes (source, translation), a language
+// SUPER + SHIFT + K summons it, straight onto a translation of the text just
+// highlighted when there is one ({"selection":true}). Two panes (source, translation), a language
 // chip per pane, and a filterable language picker. Everything the mouse can do
 // has a key: Ctrl+Enter translate, Ctrl+S swap, Ctrl+L pick the source
 // language, Ctrl+Shift+L the target, Ctrl+Shift+C copy the result,
@@ -54,6 +55,14 @@ Item {
   property bool busy: false
   property bool copied: false
   property bool showHelp: false
+
+  // The primary selection (the text highlighted right now) counts for a
+  // {"selection":true} summon only while fresh: stamped when it changes to
+  // readable text, cleared once used, when the overlay closes, or when the
+  // selection turns empty or sensitive.
+  property real selectionChangedAt: 0
+  property bool selectionWatchPrimed: false
+  readonly property int selectionFreshMs: 20000
 
   property bool pickerOpen: false
   property string pickerSide: "source"
@@ -143,6 +152,16 @@ Item {
       // from a copy inside the overlay itself; it is ignored there rather
       // than replacing the source with what was just copied out of a pane.
       if (payload.clipboard === true && !wasOpen) clipboardRead.restart()
+      // {"selection":true} translates the primary selection, the highlighted
+      // text with no copy needed, but only one made in the last
+      // selectionFreshMs. Primary is rarely empty, so without that a summon
+      // meant only to open the overlay would load, and send off, whatever was
+      // last highlighted anywhere, hours ago. A stale or missing selection
+      // leaves the panes as they were.
+      if (payload.selection === true && !wasOpen) {
+        if (root.selectionIsFresh()) selectionProc.running = true
+        root.selectionChangedAt = 0
+      }
     }
     Qt.callLater(function() { root.focusSource() })
   }
@@ -151,6 +170,13 @@ Item {
     root.opened = false
     root.pickerOpen = false
     root.showHelp = false
+    // A selection made inside the overlay is not one to translate next time.
+    root.selectionChangedAt = 0
+  }
+
+  function selectionIsFresh() {
+    return root.selectionChangedAt > 0
+      && Date.now() - root.selectionChangedAt <= root.selectionFreshMs
   }
 
   function dismiss() {
@@ -649,6 +675,52 @@ Item {
     onExited: function(exitCode, exitStatus) {
       if (exitCode !== 0) root.status = "clipboard has no text"
     }
+  }
+
+  // Reads the primary selection for {"selection":true}. Unlike the clipboard
+  // paste, an empty read is no error: there was simply nothing to translate.
+  Process {
+    id: selectionProc
+    command: ["wl-paste", "--primary", "--no-newline", "--type", "text"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var selected = String(text || "")
+        if (selected.replace(/\s/g, "") !== "") root.setSourceText(selected, true)
+      }
+    }
+  }
+
+  // Tells a fresh primary selection from a stale one. wl-paste reports each
+  // new selection; the spawned sh drains the content unread (a source left
+  // writing into a closed pipe could take SIGPIPE) and prints only
+  // CLIPBOARD_STATE, so no selected text reaches this process. The first
+  // report is the selection that already existed when the watch started, not
+  // a new one. Sensitive selections (password managers) never count.
+  Process {
+    id: selectionWatch
+    running: true
+    command: ["wl-paste", "--primary", "--watch", "sh", "-c", "cat >/dev/null; echo \"$CLIPBOARD_STATE\""]
+    onStarted: root.selectionWatchPrimed = false
+    stdout: SplitParser {
+      onRead: function(state) {
+        if (!root.selectionWatchPrimed) {
+          root.selectionWatchPrimed = true
+          return
+        }
+        root.selectionChangedAt = state === "data" ? Date.now() : 0
+      }
+    }
+    // A compositor restart ends the watch; start it again rather than lose
+    // freshness for the rest of the session.
+    onExited: selectionWatchRestart.restart()
+  }
+
+  Timer {
+    id: selectionWatchRestart
+    interval: 5000
+    repeat: false
+    onTriggered: selectionWatch.running = true
   }
 
   // ---------------------------------------------------------------- window

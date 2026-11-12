@@ -9,7 +9,7 @@ chip per pane, a filterable language picker, and a free keyless backend.
 
 | Key | Action |
 | --- | --- |
-| `Super+Shift+K` | open / close the overlay |
+| `Super+Shift+K` | open / close the overlay (on a translation of freshly highlighted text, if any) |
 | `Ctrl+Enter` | translate now |
 | `Ctrl+S` | swap languages and panes (instant — the panes exchange text) |
 | `Ctrl+L` | pick the source language |
@@ -84,7 +84,8 @@ shell starts — or restart the shell after changing them.
 ## Requirements
 
 - Omarchy Quattro (`omarchy-shell` / Quickshell `PanelWindow` overlay).
-- `wl-clipboard` (`wl-copy`, `wl-paste`) for the copy and paste shortcuts.
+- `wl-clipboard` (`wl-copy`, `wl-paste`) for the copy and paste shortcuts and
+  the selection watch.
 - Network access to `clients5.google.com` and/or `api.mymemory.translated.net`.
   No API keys, no accounts, nothing to configure.
 
@@ -106,7 +107,7 @@ omarchy plugin validate ~/.config/omarchy/plugins/io.github.baltavay.translate
 ```
 
 ```lua
-o.bind("SUPER + SHIFT + K", "Translate", "omarchy-shell shell toggle io.github.baltavay.translate")
+o.bind("SUPER + SHIFT + K", "Translate", [[omarchy-shell shell toggle io.github.baltavay.translate '{"selection":true}']])
 hl.layer_rule({ match = { namespace = "^omarchy-translate$" }, no_anim = true, animation = "none" })
 ```
 
@@ -115,7 +116,9 @@ config. Add the lines above (plus the `trigger.translate` row from
 `omarchy-menu.jsonc` if you want it in the Omarchy menu) to make it yours.
 `Super+Shift+K` is free on stock Omarchy (`Super+K` is keybindings, `Super+Alt+K`
 tmux, `Super+Ctrl+K` herdr). `omarchy-shell shell toggle io.github.baltavay.translate` is
-the same thing from a terminal.
+the same thing from a terminal. With `{"selection":true}` (see below), highlighting
+text and pressing `Super+Shift+K` opens the overlay already translating it; with
+nothing freshly highlighted it opens as before.
 
 The overlay is also summonable with a payload:
 
@@ -123,6 +126,7 @@ The overlay is also summonable with a payload:
 omarchy-shell shell toggle io.github.baltavay.translate '{"text":"Good morning","source":"en","target":"ru"}'
 omarchy-shell shell toggle io.github.baltavay.translate '{"source":"auto","target":"ru"}'
 omarchy-shell shell summon io.github.baltavay.translate '{"clipboard":true}'
+omarchy-shell shell toggle io.github.baltavay.translate '{"selection":true}'
 ```
 
 `{"clipboard":true}` translates whatever is on the clipboard, read by the
@@ -131,6 +135,20 @@ does. The read waits ~120 ms for the app that owns the selection to finish
 answering the copy that summoned it. It is ignored while the overlay is already
 open: the overlay holds the keyboard then, so the summon can only have come
 from a copy inside the overlay. Use `summon` rather than `toggle` here.
+
+`{"selection":true}` translates the primary selection, the text that is
+highlighted right now, with no copy needed and the clipboard left alone. It
+only takes a *fresh* one: highlighted within the last 20 seconds, not used by
+an earlier summon, and not made inside the overlay. Primary is rarely empty, so
+without that rule a press meant only to open the overlay would load, and send
+to the engine, whatever was last highlighted anywhere, possibly hours ago in a
+terminal. A stale, empty, or sensitive selection (one flagged by a password
+manager, `CLIPBOARD_STATE=sensitive`) leaves the panes as they were.
+
+Freshness comes from a `wl-paste --primary --watch` the plugin keeps running.
+It hands each new selection to a `sh` that drains the content unread and
+prints only the state, so the highlighted text itself never reaches the shell
+process until a summon asks for it.
 
 ### Translate on double copy
 
