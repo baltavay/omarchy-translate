@@ -14,7 +14,8 @@ import "Engines.js" as Engines
 // has a key: Ctrl+Enter translate, Ctrl+S swap, Ctrl+L pick the source
 // language, Ctrl+Shift+L the target, Ctrl+Shift+C copy the result,
 // Ctrl+Shift+V translate the clipboard, Ctrl+Shift+X clear, Ctrl+P toggle
-// auto-translate, F1 the shortcut list, Esc close.
+// auto-translate, Ctrl+E switch engine (Google / DeepL), Ctrl+Shift+E the
+// DeepL key, F1 the shortcut list, Esc close.
 //
 // The overlay lives inside the long-lived omarchy-shell process and keeps its
 // panes, chosen languages, and in-flight request across summons (manifest
@@ -35,8 +36,14 @@ Item {
   readonly property string statePath: stateDir + "/translate.json"
 
   // Which engine goes first, and the MyMemory address that lifts its quota.
+  // The engine knob only seeds the choice until one is saved from the overlay.
   readonly property string enginePreference: Quickshell.env("OMARCHY_TRANSLATE_ENGINE") || ""
   readonly property string contactEmail: Quickshell.env("OMARCHY_TRANSLATE_EMAIL") || ""
+  // DeepL's English and Portuguese targets need a variant; the region decides.
+  readonly property string localeName: Quickshell.env("LC_ALL") || Quickshell.env("LC_MESSAGES") || Quickshell.env("LANG") || ""
+  // The DeepL API key lives in its own file, mode 600, next to the state but
+  // never inside it, and outside ~/.config, which often ends up in dotfiles.
+  readonly property string deeplKeyPath: stateDir + "/translate-deepl.key"
 
   // ---------------------------------------------------------------- state
 
@@ -49,11 +56,34 @@ Item {
 
   property string engine: ""
   property string detectedLang: ""
+  // Set when Auto found the text already in the target language and the
+  // translation went to Engines.alternateLanguage(target) instead.
+  property string retargetLang: ""
   property string status: ""
   property string errorText: ""
   property bool busy: false
   property bool copied: false
   property bool showHelp: false
+
+  // "google", "deepl" or "mymemory": the engine tried first. DeepL only runs
+  // with a key; without one Google answers and the chip says so.
+  property string engineChoice: {
+    var pref = String(root.enginePreference).toLowerCase()
+    return pref === "deepl" || pref === "mymemory" ? pref : "google"
+  }
+  property string deeplKey: ""
+  property real deeplUsed: -1
+  property real deeplLimit: -1
+  property bool keyPanelOpen: false
+  property bool keyChecking: false
+  property string keyStatus: ""
+  property int sideSeq: 0
+  property var sideHandle: null
+  readonly property bool deeplActive: engineChoice === "deepl" && deeplKey !== ""
+  readonly property string engineLabel: engineChoice === "deepl"
+    ? (deeplKey === "" ? "DeepL · no key" : deeplLimit > 0
+        ? "DeepL · " + shortCount(deeplUsed) + " / " + shortCount(deeplLimit) : "DeepL")
+    : engineChoice === "mymemory" ? "MyMemory" : "Google"
 
   property bool pickerOpen: false
   property string pickerSide: "source"
@@ -65,7 +95,6 @@ Item {
   property int pendingSeq: -1
   property bool queuedTranslate: false
   property var activeRequest: null
-  property var timedOutRequest: null
   property real startedAt: 0
   property string translatedSource: ""
   property bool syncingText: false
@@ -113,6 +142,8 @@ Item {
     { keys: "Ctrl+Shift+V", action: "translate the clipboard" },
     { keys: "Ctrl+Shift+X", action: "clear both panes" },
     { keys: "Ctrl+P", action: "toggle auto-translate" },
+    { keys: "Ctrl+E", action: "switch engine: Google / DeepL" },
+    { keys: "Ctrl+Shift+E", action: "set or forget the DeepL API key" },
     { keys: "Ctrl+A / C / V", action: "select all / copy / paste" },
     { keys: "Tab / Shift+Tab", action: "move focus between panes" },
     { keys: "Esc", action: "close" }
@@ -135,6 +166,8 @@ Item {
         root.setSourceText(payload.text, true)
       }
     }
+    // Reading the usage spends no quota; it keeps the chip's count current.
+    if (root.deeplActive) root.refreshUsage()
     Qt.callLater(function() { root.focusSource() })
   }
 
@@ -142,6 +175,7 @@ Item {
     root.opened = false
     root.pickerOpen = false
     root.showHelp = false
+    root.closeKeyPanel()
   }
 
   function dismiss() {
@@ -223,6 +257,7 @@ Item {
   function clearAll() {
     debounce.stop()
     root.translatedSource = ""
+    root.retargetLang = ""
     root.setSourceText("")
     root.setResultText("")
     root.status = ""
@@ -232,14 +267,17 @@ Item {
 
   function swap() {
     var from = root.sourceLang
-    var to = root.targetLang
+    // The language the result pane really holds: after a retarget that is
+    // not the target, and swapping must trade the real pair.
+    var to = root.retargetLang !== "" ? root.retargetLang : root.targetLang
+    root.retargetLang = ""
 
     if (from === "auto") {
       // Nothing concrete to translate from: pin the detected language instead,
       // and let the old target take over as the source.
       var detected = Languages.exists(root.detectedLang) ? root.detectedLang : "en"
       root.sourceLang = to
-      root.targetLang = detected === to ? (to === "en" ? "ru" : "en") : detected
+      root.targetLang = detected === to ? Engines.alternateLanguage(to) : detected
     } else {
       root.sourceLang = to
       root.targetLang = from === to ? "en" : from
@@ -327,25 +365,33 @@ Item {
     root.startFetch(text)
   }
 
-  // The transport Engines issues requests through: an XHR capped by the
-  // fetchTimeout Timer. Only one request is in flight at a time (chunks go out
-  // one by one), so a single Timer and a single slot for the request to abort
-  // are enough.
-  function timedRequest(url, timeoutMs, onReply) {
+  // An XHR capped by a wall-clock Timer. A target is a GET URL or
+  // {method, url, headers, body} (see Engines.js). Each Timer guards one
+  // request at a time, held in its `request` slot.
+  function timedXhr(target, timeoutMs, timer, onReply) {
+    var spec = Engines.requestSpec(target)
     var xhr = new XMLHttpRequest()
     var settled = false
     var stopped = false
     var timedOut = false
+    var handle = {
+      abort: function() { stopped = true; xhr.abort() },
+      timeOut: function() { timedOut = true; xhr.abort() }
+    }
 
     function settle(reply) {
       if (settled) return
       settled = true
-      root.timedOutRequest = null
-      fetchTimeout.stop()
+      if (timer.request === handle) {
+        timer.request = null
+        timer.stop()
+      }
       onReply(reply)
     }
 
-    xhr.open("GET", url)
+    xhr.open(spec.method || "GET", spec.url)
+    var headers = spec.headers || {}
+    for (var name in headers) xhr.setRequestHeader(name, headers[name])
     xhr.timeout = timeoutMs // honored where the engine supports it
     xhr.onreadystatechange = function() {
       if (xhr.readyState !== XMLHttpRequest.DONE) return
@@ -356,16 +402,39 @@ Item {
     }
     xhr.onerror = function() { settle({ error: "unreachable" }) }
     xhr.onabort = function() { settle({ error: timedOut ? "timeout" : stopped ? "cancelled" : "unreachable" }) }
-    xhr.send()
 
-    var handle = {
-      abort: function() { stopped = true; xhr.abort() },
-      timeOut: function() { timedOut = true; xhr.abort() }
-    }
-    root.timedOutRequest = handle
-    fetchTimeout.interval = Math.max(1, timeoutMs)
-    fetchTimeout.restart()
+    timer.request = handle
+    timer.interval = Math.max(1, timeoutMs)
+    timer.restart()
+    if (spec.body === undefined) xhr.send()
+    else xhr.send(spec.body)
     return handle
+  }
+
+  // The transport Engines issues translations through. Only one is in flight
+  // at a time (chunks go out one by one), so fetchTimeout alone guards them.
+  function timedRequest(target, timeoutMs, onReply) {
+    return root.timedXhr(target, timeoutMs, fetchTimeout, onReply)
+  }
+
+  // Requests beside a translation (checking a DeepL key, reading its usage)
+  // get their own Timer, so they never cut short a translation in flight. A
+  // newer one supersedes an older one, whose answer is then dropped.
+  function sideRequest(target, timeoutMs, onReply) {
+    root.abortSideRequest()
+    var seq = root.sideSeq
+    root.sideHandle = root.timedXhr(target, timeoutMs, sideTimeout, function(reply) {
+      if (seq !== root.sideSeq) return
+      root.sideHandle = null
+      onReply(reply)
+    })
+  }
+
+  function abortSideRequest() {
+    root.sideSeq += 1
+    var handle = root.sideHandle
+    root.sideHandle = null
+    if (handle) handle.abort()
   }
 
   function startFetch(text) {
@@ -380,8 +449,11 @@ Item {
       text: text,
       from: root.sourceLang,
       to: root.targetLang,
-      engine: root.enginePreference,
+      engine: root.engineChoice,
       email: root.contactEmail,
+      deeplKey: root.deeplKey,
+      locale: root.localeName,
+      retarget: root.sourceLang === "auto" ? Engines.alternateLanguage(root.targetLang) : "",
       request: root.timedRequest
     }, function(reply) {
       if (seq !== root.pendingSeq) return
@@ -389,8 +461,10 @@ Item {
       root.activeRequest = null
       root.busy = false
 
+      var fallbacks = root.fallbackNotes(reply.skipped)
       if (reply.ok !== true) {
-        root.fail(String(reply.error || "translation failed"))
+        root.fail(String(reply.error || "translation failed")
+          + (fallbacks.length ? " (" + fallbacks.join(", ") + ")" : ""))
         return
       }
 
@@ -398,6 +472,12 @@ Item {
       root.setResultText(String(reply.text || ""))
       root.engine = String(reply.engine || "")
       if (reply.detected) root.detectedLang = String(reply.detected)
+      root.retargetLang = reply.retargeted ? String(reply.retargeted) : ""
+      // DeepL bills the source characters (twice when the text had to be
+      // retargeted); keep the chip's count close until the next open reads
+      // the real figure.
+      if (root.engine === "deepl" && root.deeplUsed >= 0)
+        root.deeplUsed += text.length * (root.retargetLang !== "" ? 2 : 1)
       root.errorText = ""
       var parts = []
       if (root.engine && root.engine !== "none") parts.push(root.engine)
@@ -405,8 +485,134 @@ Item {
       parts.push(root.sourceText.length + " chars")
       if (root.sourceLang === "auto" && root.detectedLang)
         parts.push("detected " + root.detectedLang)
+      if (root.retargetLang !== "")
+        parts.push("already " + root.targetChip + " → " + Languages.chip(root.retargetLang))
+      for (var i = 0; i < fallbacks.length; i++) parts.push(fallbacks[i])
       root.status = parts.join(" · ")
     })
+  }
+
+  // Why the engines ahead of the one that answered did not, for the status
+  // line: a fallback from DeepL to Google should never pass unnoticed.
+  function fallbackNotes(skipped) {
+    var notes = []
+    var list = Array.isArray(skipped) ? skipped : []
+    for (var i = 0; i < list.length; i++) {
+      var name = list[i].engine === "deepl" ? "DeepL" : String(list[i].engine)
+      var note = name + ": " + list[i].reason
+      if (list[i].engine === "deepl" && list[i].reason === "key rejected") note += " (Ctrl+Shift+E)"
+      notes.push(note)
+    }
+    return notes
+  }
+
+  // ---------------------------------------------------------------- engine
+
+  function shortCount(n) {
+    if (n >= 1000000) return (Math.round(n / 100000) / 10) + "M"
+    if (n >= 1000) return Math.round(n / 1000) + "k"
+    return String(Math.max(0, Math.round(n)))
+  }
+
+  // Ctrl+E: Google <-> DeepL. Choosing DeepL without a key asks for one, and
+  // DeepL becomes the engine only once it has accepted that key.
+  function toggleEngine() {
+    if (root.engineChoice === "deepl") { root.setEngine("google"); return }
+    if (root.deeplKey === "") { root.openKeyPanel(); return }
+    root.setEngine("deepl")
+    root.refreshUsage()
+  }
+
+  function setEngine(name) {
+    if (root.engineChoice === name) return
+    root.engineChoice = name
+    root.errorText = ""
+    if (root.autoTranslate && root.sourceText.replace(/\s/g, "") !== "") {
+      debounce.stop()
+      root.translateNow(true)
+    } else {
+      root.status = (name === "deepl" ? "DeepL" : "Google") + " selected"
+    }
+  }
+
+  function refreshUsage() {
+    var key = root.deeplKey
+    if (key === "") return
+    root.sideRequest(Engines.deeplGet(key, "/v2/usage"), 10000, function(reply) {
+      var usage = Engines.parseDeeplUsage(reply)
+      if (!usage.ok || key !== root.deeplKey) return
+      root.deeplUsed = usage.used
+      root.deeplLimit = usage.limit
+    })
+  }
+
+  // --------------------------------------------------------------- deepl key
+
+  function openKeyPanel() {
+    root.pickerOpen = false
+    root.showHelp = false
+    root.keyStatus = ""
+    root.keyChecking = false
+    keyInput.text = ""
+    root.keyPanelOpen = true
+    Qt.callLater(function() { keyInput.forceActiveFocus() })
+  }
+
+  function closeKeyPanel() {
+    var wasOpen = root.keyPanelOpen
+    root.keyPanelOpen = false
+    root.keyChecking = false
+    root.keyStatus = ""
+    keyInput.text = ""
+    if (wasOpen) {
+      root.abortSideRequest()
+      if (root.opened) root.focusSource()
+    }
+  }
+
+  // A pasted key is checked against /v2/usage, which spends no quota, and is
+  // kept only when DeepL accepts it.
+  function submitKey(raw) {
+    var key = String(raw || "").trim()
+    if (key === "" || /\s/.test(key)) {
+      root.keyStatus = "paste the whole key from deepl.com/your-account/keys"
+      return
+    }
+    root.keyChecking = true
+    root.keyStatus = "checking the key with DeepL…"
+    root.sideRequest(Engines.deeplGet(key, "/v2/usage"), 10000, function(reply) {
+      root.keyChecking = false
+      var usage = Engines.parseDeeplUsage(reply)
+      if (!usage.ok) {
+        root.keyStatus = "DeepL: " + usage.reason
+        return
+      }
+      root.saveKey(key)
+      root.deeplUsed = usage.used
+      root.deeplLimit = usage.limit
+      root.closeKeyPanel()
+      if (root.engineChoice === "deepl") root.status = "DeepL key saved"
+      else root.setEngine("deepl")
+    })
+  }
+
+  // The key goes to the writer on stdin, like the clipboard text to wl-copy:
+  // never on a command line. umask 077 makes the file 600 from the start.
+  function saveKey(key) {
+    root.deeplKey = key
+    keyWriter.payload = key
+    keyWriter.stdinEnabled = true
+    keyWriter.running = true
+  }
+
+  function forgetKey() {
+    root.deeplKey = ""
+    root.deeplUsed = -1
+    root.deeplLimit = -1
+    Quickshell.execDetached(["rm", "-f", root.deeplKeyPath])
+    root.closeKeyPanel()
+    if (root.engineChoice === "deepl") root.setEngine("google")
+    root.status = "DeepL key forgotten"
   }
 
   function cancelFetch() {
@@ -432,6 +638,7 @@ Item {
   // -------------------------------------------------------- language picker
 
   function openPicker(side) {
+    root.closeKeyPanel()
     root.pickerSide = side === "target" ? "target" : "source"
     root.pickerOpen = true
     root.showHelp = false
@@ -493,6 +700,7 @@ Item {
       root.sourceLang = code
     }
     root.detectedLang = ""
+    root.retargetLang = ""
   }
 
   // ------------------------------------------------------------ shortcuts
@@ -504,9 +712,10 @@ Item {
       && (event.modifiers & Qt.AltModifier) === 0
       && (event.modifiers & Qt.MetaModifier) === 0
 
-    if (event.key === Qt.Key_F1) { root.showHelp = !root.showHelp; return true }
+    if (event.key === Qt.Key_F1) { root.closeKeyPanel(); root.showHelp = !root.showHelp; return true }
     if (event.key === Qt.Key_Escape) {
-      if (root.pickerOpen) root.closePicker()
+      if (root.keyPanelOpen) root.closeKeyPanel()
+      else if (root.pickerOpen) root.closePicker()
       else if (root.showHelp) root.showHelp = false
       else if (root.busy) root.cancelFetch()
       else root.dismiss()
@@ -517,6 +726,8 @@ Item {
     if (plain && event.key === Qt.Key_S) { root.swap(); return true }
     if (plain && event.key === Qt.Key_L) { root.openPicker("source"); return true }
     if (plain && event.key === Qt.Key_P) { root.toggleAuto(); return true }
+    if (plain && event.key === Qt.Key_E) { root.toggleEngine(); return true }
+    if (ctrl && shift && event.key === Qt.Key_E) { root.openKeyPanel(); return true }
     if (plain && event.key === Qt.Key_1) { if (root.pickerOpen) root.pickerSide = "source"; else root.focusSource(); return true }
     if (plain && event.key === Qt.Key_2) { if (root.pickerOpen) root.pickerSide = "target"; else root.focusResult(); return true }
     if (ctrl && shift && event.key === Qt.Key_L) { root.openPicker("target"); return true }
@@ -539,6 +750,8 @@ Item {
     if (typeof state.target === "string" && Languages.exists(state.target) && state.target !== "auto")
       root.targetLang = state.target
     if (typeof state.auto === "boolean") root.autoTranslate = state.auto
+    if (state.engine === "google" || state.engine === "deepl" || state.engine === "mymemory")
+      root.engineChoice = state.engine
   }
 
   function writeState() {
@@ -546,13 +759,15 @@ Item {
       version: 1,
       source: root.sourceLang,
       target: root.targetLang,
-      auto: root.autoTranslate
+      auto: root.autoTranslate,
+      engine: root.engineChoice
     }, null, 2) + "\n")
   }
 
   onSourceLangChanged: stateSave.restart()
   onTargetLangChanged: stateSave.restart()
   onAutoTranslateChanged: stateSave.restart()
+  onEngineChoiceChanged: stateSave.restart()
 
   Component.onCompleted: {
     Quickshell.execDetached(["mkdir", "-p", root.stateDir])
@@ -580,11 +795,24 @@ Item {
   // used to.
   Timer {
     id: fetchTimeout
+    property var request: null
     repeat: false
     onTriggered: {
-      var request = root.timedOutRequest
-      root.timedOutRequest = null
-      if (request) request.timeOut()
+      var pending = fetchTimeout.request
+      fetchTimeout.request = null
+      if (pending) pending.timeOut()
+    }
+  }
+
+  // The same wall clock for side requests (a DeepL key check, its usage).
+  Timer {
+    id: sideTimeout
+    property var request: null
+    repeat: false
+    onTriggered: {
+      var pending = sideTimeout.request
+      sideTimeout.request = null
+      if (pending) pending.timeOut()
     }
   }
 
@@ -601,6 +829,28 @@ Item {
     atomicWrites: true
     printErrors: false
     onLoaded: root.loadState(text())
+  }
+
+  // Missing until a key is saved; a load failure then just means "no key".
+  FileView {
+    id: deeplKeyFile
+    path: root.deeplKeyPath
+    printErrors: false
+    onLoaded: root.deeplKey = String(text() || "").trim()
+  }
+
+  Process {
+    id: keyWriter
+    property string payload: ""
+    command: ["sh", "-c", "umask 077 && mkdir -p \"$1\" && rm -f \"$2.tmp\" && cat > \"$2.tmp\" && mv -f \"$2.tmp\" \"$2\"",
+      "sh", root.stateDir, root.deeplKeyPath]
+    stdinEnabled: false
+    onStarted: {
+      write(payload)
+      payload = ""
+      // Closing stdin ends cat's input once the key is out.
+      stdinEnabled = false
+    }
   }
 
   // The translation itself needs no process at all (see Engines.js); this is
@@ -688,6 +938,7 @@ Item {
 
           // ------------------------------------------------------- header
           Item {
+            id: header
             width: parent.width
             height: root.headerHeight
 
@@ -715,17 +966,35 @@ Item {
               }
             }
 
-            Text {
+            Row {
               anchors.right: parent.right
               anchors.verticalCenter: parent.verticalCenter
-              width: Math.min(implicitWidth, parent.width * 0.6)
-              horizontalAlignment: Text.AlignRight
-              elide: Text.ElideRight
-              textFormat: Text.PlainText
-              text: root.errorText !== "" ? root.errorText : root.status
-              color: root.errorText !== "" ? root.urgent : (root.copied ? root.accent : root.muted)
-              font.family: root.chromeFont
-              font.pixelSize: Style.font.bodySmall
+              spacing: Style.spacing.controlGap
+
+              Text {
+                anchors.verticalCenter: parent.verticalCenter
+                width: Math.min(implicitWidth, header.width * 0.55)
+                horizontalAlignment: Text.AlignRight
+                elide: Text.ElideRight
+                textFormat: Text.PlainText
+                text: root.errorText !== "" ? root.errorText : root.status
+                color: root.errorText !== "" ? root.urgent : (root.copied ? root.accent : root.muted)
+                font.family: root.chromeFont
+                font.pixelSize: Style.font.bodySmall
+              }
+
+              Ui.Button {
+                anchors.verticalCenter: parent.verticalCenter
+                text: root.engineLabel
+                tooltipText: "Ctrl+E — switch engine (Google / DeepL) · Ctrl+Shift+E — DeepL key"
+                bordered: true
+                selected: root.keyPanelOpen
+                fontSize: Style.font.bodySmall
+                fontFamily: root.chromeFont
+                horizontalPadding: Style.spacing.controlPaddingX
+                verticalPadding: Style.spacing.xxs
+                onClicked: root.toggleEngine()
+              }
             }
           }
 
@@ -737,7 +1006,7 @@ Item {
             Row {
               anchors.fill: parent
               spacing: root.paneGap
-              visible: !root.pickerOpen && !root.showHelp
+              visible: !root.pickerOpen && !root.showHelp && !root.keyPanelOpen
 
               // source pane
               Ui.BorderSurface {
@@ -897,8 +1166,13 @@ Item {
                     spacing: Style.spacing.controlGap
 
                     Ui.Button {
-                      text: root.targetChip + " ▾"
-                      tooltipText: root.targetLanguage ? root.targetLanguage.name : root.targetChip
+                      text: root.retargetLang !== ""
+                        ? root.targetChip + " → " + Languages.chip(root.retargetLang) + " ▾"
+                        : root.targetChip + " ▾"
+                      tooltipText: root.retargetLang !== ""
+                        ? "Already in " + (root.targetLanguage ? root.targetLanguage.name : root.targetChip)
+                          + ", so translated into " + (Languages.byCode(root.retargetLang) ? Languages.byCode(root.retargetLang).name : root.retargetLang)
+                        : (root.targetLanguage ? root.targetLanguage.name : root.targetChip)
                       bordered: true
                       fontSize: Style.font.bodySmall
                       fontFamily: root.chromeFont
@@ -1251,6 +1525,149 @@ Item {
                 Text {
                   textFormat: Text.PlainText
                   text: "F1 hides this list · languages persist in " + root.statePath
+                  color: root.muted
+                  opacity: 0.7
+                  font.family: root.chromeFont
+                  font.pixelSize: Style.font.caption
+                }
+              }
+            }
+
+            // -------------------------------------------------- deepl key
+            Ui.BorderSurface {
+              anchors.fill: parent
+              visible: root.keyPanelOpen
+              radius: root.cornerRadius
+              color: Style.controlFill(true, false, root.foreground, root.accent)
+              borderSpec: root.focusPaneBorder
+              padding: root.panePadding
+
+              Column {
+                anchors.fill: parent
+                anchors.topMargin: parent.contentTopInset
+                anchors.rightMargin: parent.contentRightInset
+                anchors.bottomMargin: parent.contentBottomInset
+                anchors.leftMargin: parent.contentLeftInset
+                spacing: Style.spacing.sm
+
+                Text {
+                  textFormat: Text.PlainText
+                  text: "DeepL API key"
+                  color: root.accent
+                  font.family: root.chromeFont
+                  font.pixelSize: Style.font.subtitle
+                }
+
+                Text {
+                  width: parent.width
+                  wrapMode: Text.WordWrap
+                  textFormat: Text.PlainText
+                  text: root.deeplKey !== ""
+                    ? "A key is saved. Paste a new one to replace it, or forget it."
+                    : "Translate with DeepL on your own API key. The free plan covers 500 000 characters a month."
+                  color: root.foreground
+                  font.family: root.chromeFont
+                  font.pixelSize: Style.font.body
+                }
+
+                Item {
+                  width: parent.width
+                  height: Math.max(Style.space(28), Style.font.body + Style.spacing.controlPaddingY * 2)
+
+                  TextInput {
+                    id: keyInput
+                    anchors.fill: parent
+                    anchors.leftMargin: Style.spacing.controlPaddingX
+                    anchors.rightMargin: Style.spacing.controlPaddingX
+                    verticalAlignment: TextInput.AlignVCenter
+                    echoMode: TextInput.Password
+                    passwordCharacter: "•"
+                    readOnly: root.keyChecking
+                    color: root.foreground
+                    selectionColor: Style.selectionFillFor(root.foreground, root.accent)
+                    selectedTextColor: root.foreground
+                    font.family: root.chromeFont
+                    font.pixelSize: Style.font.body
+                    onAccepted: if (!root.keyChecking) root.submitKey(text)
+                    Keys.onEscapePressed: root.closeKeyPanel()
+                  }
+
+                  Text {
+                    anchors.left: parent.left
+                    anchors.leftMargin: Style.spacing.controlPaddingX
+                    anchors.verticalCenter: parent.verticalCenter
+                    enabled: false
+                    visible: keyInput.text === ""
+                    textFormat: Text.PlainText
+                    text: "Paste the key here (a free-plan key ends in :fx)"
+                    color: root.muted
+                    opacity: 0.7
+                    font.family: root.chromeFont
+                    font.pixelSize: Style.font.body
+                  }
+
+                  Rectangle {
+                    anchors.bottom: parent.bottom
+                    width: parent.width
+                    height: Math.max(1, Style.space(1))
+                    color: Util.alpha(root.foreground, 0.25)
+                  }
+                }
+
+                Text {
+                  width: parent.width
+                  visible: root.keyStatus !== ""
+                  wrapMode: Text.WordWrap
+                  textFormat: Text.PlainText
+                  text: root.keyStatus
+                  color: root.keyChecking ? root.muted : root.urgent
+                  font.family: root.chromeFont
+                  font.pixelSize: Style.font.bodySmall
+                }
+
+                Row {
+                  spacing: Style.spacing.sm
+
+                  Ui.Button {
+                    text: "check & save"
+                    tooltipText: "Enter — check the key with DeepL, then save it"
+                    bordered: true
+                    fontSize: Style.font.bodySmall
+                    fontFamily: root.chromeFont
+                    horizontalPadding: Style.spacing.controlPaddingX
+                    verticalPadding: Style.spacing.xxs
+                    onClicked: if (!root.keyChecking) root.submitKey(keyInput.text)
+                  }
+
+                  Ui.Button {
+                    visible: root.deeplKey !== ""
+                    text: "forget key"
+                    tooltipText: "Delete the saved key and go back to Google"
+                    bordered: true
+                    fontSize: Style.font.bodySmall
+                    fontFamily: root.chromeFont
+                    horizontalPadding: Style.spacing.controlPaddingX
+                    verticalPadding: Style.spacing.xxs
+                    onClicked: root.forgetKey()
+                  }
+
+                  Ui.Button {
+                    text: "cancel"
+                    tooltipText: "Esc"
+                    fontSize: Style.font.bodySmall
+                    fontFamily: root.chromeFont
+                    horizontalPadding: Style.spacing.controlPaddingX
+                    verticalPadding: Style.spacing.xxs
+                    onClicked: root.closeKeyPanel()
+                  }
+                }
+
+                Text {
+                  width: parent.width
+                  wrapMode: Text.WordWrap
+                  textFormat: Text.PlainText
+                  text: "Get a key at deepl.com/your-account/keys (DeepL API Free). It is kept in "
+                    + root.deeplKeyPath + " (mode 600) and sent only to DeepL, in a request header."
                   color: root.muted
                   opacity: 0.7
                   font.family: root.chromeFont

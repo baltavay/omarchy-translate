@@ -19,6 +19,8 @@ chip per pane, a filterable language picker, and a free keyless backend.
 | `Ctrl+Shift+V` | translate whatever is on the clipboard |
 | `Ctrl+Shift+X` | clear both panes |
 | `Ctrl+P` | toggle translate-while-typing |
+| `Ctrl+E` | switch engine: Google / DeepL (asks for a DeepL key the first time) |
+| `Ctrl+Shift+E` | set, replace, or forget the DeepL API key |
 | `Tab` / `Shift+Tab` | move focus between panes |
 | `F1` | show the shortcut list |
 | `Esc` | close the picker, then the overlay (cancels an in-flight request) |
@@ -34,7 +36,11 @@ In the language picker: type to filter (code, English name or native name),
   overlay comes back the way you left it after a shell restart.
 - With auto-translate on (the default), typing translates after 600 ms of
   quiet; `Ctrl+Enter` translates immediately, request per pause.
-- Source `Auto` detects the input language and shows what it detected.
+- Source `Auto` detects the input language and shows what it detected. Text
+  that turns out to be in the target language already is translated into
+  English instead (Russian when the target is English): the target chip reads
+  `UK → EN`, the status says `already UK → EN`, and `Ctrl+S` swaps that real
+  pair. Finding out takes one request, so such text costs two.
 - `Esc` during a request aborts it instead of waiting for the endpoint.
 
 ## Backend
@@ -56,6 +62,29 @@ Engines, tried in order:
 2. **mymemory** — `api.mymemory.translated.net/get`, keyless, ~5k characters/day
    anonymous.
 
+### DeepL (optional)
+
+With a DeepL API key, DeepL can go first instead: press `Ctrl+E` (or click the
+engine chip in the header) to switch between Google and DeepL. The first time,
+the overlay asks for a key. Get one at
+[deepl.com/your-account/keys](https://www.deepl.com/your-account/keys); the
+DeepL API Free plan covers 500 000 characters a month.
+
+- The key is checked against `/v2/usage`, which spends no quota, and saved only
+  if DeepL accepts it. It is written through stdin (never a command line) to
+  `~/.local/state/omarchy/translate-deepl.key`, mode 600, outside `~/.config`
+  so it stays out of dotfiles repos. `Ctrl+Shift+E` replaces or forgets it.
+- Requests go to `api-free.deepl.com` for free-plan keys (ending in `:fx`) and
+  `api.deepl.com` otherwise, as a JSON POST with the key in the
+  `Authorization` header.
+- When DeepL cannot answer (quota spent, key rejected, a language it does not
+  support, rate limit, network), Google and then MyMemory take over, and the
+  status line says why, e.g. `google · … · DeepL: quota exceeded`.
+- The chip shows the month's usage (`DeepL · 12k / 500k`), read on each open.
+- English and Portuguese targets need a variant on DeepL; the locale's region
+  picks it (`en_GB` → `EN-GB`, `pt_PT` → `PT-PT`), US and Brazilian otherwise.
+- The chosen engine persists in `translate.json` with the languages.
+
 Long text is chunked so no single request exceeds what an endpoint accepts, and
 the chunks are rejoined on the newlines they were split on.
 
@@ -63,7 +92,7 @@ Knobs (environment):
 
 | Variable | Effect |
 | --- | --- |
-| `OMARCHY_TRANSLATE_ENGINE` | `google` (default) or `mymemory` — which engine is tried first |
+| `OMARCHY_TRANSLATE_ENGINE` | `google` (default), `deepl` or `mymemory` — the engine tried first, until one is chosen in the overlay |
 | `OMARCHY_TRANSLATE_EMAIL` | any address; raises MyMemory's anonymous daily quota |
 
 Both come from the shell process's own environment, so export them before the
@@ -86,7 +115,9 @@ shell starts — or restart the shell after changing them.
 - Omarchy Quattro (`omarchy-shell` / Quickshell `PanelWindow` overlay).
 - `wl-clipboard` (`wl-copy`, `wl-paste`) for the copy and paste shortcuts.
 - Network access to `clients5.google.com` and/or `api.mymemory.translated.net`.
-  No API keys, no accounts, nothing to configure.
+  No API keys, no accounts, nothing to configure — DeepL is the one opt-in
+  exception, and only reaches `api-free.deepl.com` / `api.deepl.com` once you
+  give it a key.
 
 ## Install
 
@@ -130,6 +161,7 @@ omarchy-shell shell toggle io.github.baltavay.translate '{"source":"auto","targe
 omarchy plugin disable io.github.baltavay.translate   # or: remove the id from shell.json plugins[]
 omarchy plugin remove  io.github.baltavay.translate
 rm ~/.local/state/omarchy/translate.json              # the remembered language pair
+rm ~/.local/state/omarchy/translate-deepl.key         # the DeepL API key, if one was saved
 ```
 
 Then drop the `o.bind(...)` line and the `hl.layer_rule(...)` line from
