@@ -121,6 +121,7 @@ Item {
   // ------------------------------------------------------------ lifecycle
 
   function open(payloadJson) {
+    var wasOpen = root.opened
     root.opened = true
     root.pickerOpen = false
     root.showHelp = false
@@ -134,6 +135,14 @@ Item {
       if (typeof payload.text === "string") {
         root.setSourceText(payload.text, true)
       }
+      // {"clipboard":true} translates the clipboard, so a copy shortcut can
+      // summon the overlay without the copied text ever riding on a command
+      // line. The app that owns the selection may still be answering that
+      // keypress, so the read waits a beat instead of racing it. While open,
+      // the overlay holds the keyboard, so such a summon can only have come
+      // from a copy inside the overlay itself; it is ignored there rather
+      // than replacing the source with what was just copied out of a pane.
+      if (payload.clipboard === true && !wasOpen) clipboardRead.restart()
     }
     Qt.callLater(function() { root.focusSource() })
   }
@@ -564,6 +573,13 @@ Item {
     interval: 600
     repeat: false
     onTriggered: root.translateNow(false)
+  }
+
+  Timer {
+    id: clipboardRead
+    interval: 120
+    repeat: false
+    onTriggered: if (root.opened) root.pasteSource()
   }
 
   Timer {

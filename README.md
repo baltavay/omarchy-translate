@@ -122,7 +122,66 @@ The overlay is also summonable with a payload:
 ```bash
 omarchy-shell shell toggle io.github.baltavay.translate '{"text":"Good morning","source":"en","target":"ru"}'
 omarchy-shell shell toggle io.github.baltavay.translate '{"source":"auto","target":"ru"}'
+omarchy-shell shell summon io.github.baltavay.translate '{"clipboard":true}'
 ```
+
+`{"clipboard":true}` translates whatever is on the clipboard, read by the
+plugin itself, so the text never rides on a command line the way `"text"`
+does. The read waits ~120 ms for the app that owns the selection to finish
+answering the copy that summoned it. It is ignored while the overlay is already
+open: the overlay holds the keyboard then, so the summon can only have come
+from a copy inside the overlay. Use `summon` rather than `toggle` here.
+
+### Translate on double copy
+
+Pressing the copy shortcut twice in quick succession (DeepL-style `Ctrl+C+C`)
+can open the overlay on what you just copied. Hyprland's Lua config can count
+the presses itself, so a single copy spawns nothing. In
+`~/.config/hypr/bindings.lua`:
+
+```lua
+local function double_tap(action, window_ms)
+  local armed, seq = 0, 0
+  return function()
+    if armed ~= 0 then
+      armed = 0
+      action()
+      return
+    end
+    seq = seq + 1
+    local mine = seq
+    armed = mine
+    hl.timer(function()
+      if armed == mine then armed = 0 end
+    end, { timeout = window_ms, type = "oneshot" })
+  end
+end
+
+local function translate_clipboard()
+  hl.exec_cmd([[omarchy-shell -q shell summon io.github.baltavay.translate '{"clipboard":true}']])
+end
+
+local function active_window_is_terminal()
+  local window = hl.get_active_window()
+  for _, tag in ipairs(window and window.tags or {}) do
+    if tag:gsub("%*$", "") == "terminal" then return true end
+  end
+  return false
+end
+
+-- Super+C, C: added next to Omarchy's universal copy, not instead of it.
+o.bind("SUPER + C", "Translate on double copy", double_tap(translate_clipboard, 400))
+
+-- Ctrl+C, C: non_consuming so the app still copies. Skipped in terminals,
+-- where Ctrl+C is SIGINT and a double one often means "quit".
+local ctrl_c_tap = double_tap(translate_clipboard, 400)
+o.bind("CTRL + C", "Translate on double copy", function()
+  if not active_window_is_terminal() then ctrl_c_tap() end
+end, { non_consuming = true })
+```
+
+Each combination gets its own counter, so the synthetic `Ctrl+C` that universal
+copy sends never pairs with a `Super+C` into a false double press.
 
 ## Removal
 
