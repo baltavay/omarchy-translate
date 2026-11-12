@@ -29,8 +29,10 @@ In the language picker: type to filter (code, English name or native name),
 
 ## Behaviour
 
-- Default pair is English → Russian; the pair, the auto-translate switch, and
-  the last panes persist in `~/.local/state/omarchy/translate.json`, so the
+- Default pair is Auto → your own language, taken from the locale the way
+  gettext picks one (`LANGUAGE`, then `LC_ALL` / `LC_MESSAGES` / `LANG`), or
+  English when the locale is `C` or a language the table lacks. The pair
+  (Auto included), the auto-translate switch, and the last panes persist in `~/.local/state/omarchy/translate.json`, so the
   overlay comes back the way you left it after a shell restart.
 - With auto-translate on (the default), typing translates after 600 ms of
   quiet; `Ctrl+Enter` translates immediately, request per pause.

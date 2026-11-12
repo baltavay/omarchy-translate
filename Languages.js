@@ -81,6 +81,38 @@ function byCode(code) {
 
 function exists(code) { return byCode(code) !== null; }
 
+// A POSIX locale name ("uk_UA.UTF-8", "sr_RS@latin", "zh_TW") as a table code,
+// or "" for none ("C", "POSIX", unset).
+function localeCode(tag) {
+  var base = String(tag || "").split(".")[0].split("@")[0];
+  if (base === "" || base === "C" || base === "POSIX") return "";
+  var parts = base.split(/[_-]/);
+  var lang = parts[0].toLowerCase();
+  var region = (parts[1] || "").toUpperCase();
+  if (lang === "zh")
+    return region === "TW" || region === "HK" || region === "MO" ? "zh-TW" : "zh-CN";
+  if (lang === "nb" || lang === "nn") return "no";
+  if (lang === "iw") return "he";
+  if (lang === "fil") return "tl";
+  return lang;
+}
+
+// The default target before any pair has been saved: the user's own language,
+// picked the way gettext picks a message language. LC_ALL, else LC_MESSAGES,
+// else LANG is the locale; unless that is C/POSIX, the LANGUAGE priority list
+// comes first. The first entry the table knows wins; "en" when none does.
+function fromLocale(language, lcAll, lcMessages, lang) {
+  var locale = String(lcAll || "") || String(lcMessages || "") || String(lang || "");
+  var candidates = [];
+  if (localeCode(locale) !== "") candidates = String(language || "").split(":");
+  candidates.push(locale);
+  for (var i = 0; i < candidates.length; i++) {
+    var code = localeCode(candidates[i]);
+    if (code !== "" && code !== "auto" && exists(code)) return code;
+  }
+  return "en";
+}
+
 // "EN", "ZH-CN" — what fits on a chip.
 function chip(code) { return String(code || "").toUpperCase(); }
 
